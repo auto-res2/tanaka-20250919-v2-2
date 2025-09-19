@@ -1,0 +1,155 @@
+
+Input:
+You are a cutting-edge AI researcher. Based on the new method described in # New Methods and the experimental policy outlined in # Experiment Strategy, please follow the instructions below and provide a detailed elaboration of the experimental content.
+
+# Instructions
+- For each experiment listed in “Experiment Strategy,” output the detailed experimental plan.
+- Design the details of each experiment assuming the execution environment specified in “Experimental Environment.”
+- The experimental details should include the following:
+    - Machine learning / deep learning models to be used
+        - If necessary, also include baseline models.
+    - Datasets
+    - Dataset preprocessing methods
+    - Data splitting method (train/val/test, cross-validation)
+    - Number of repetitions (number of seeds), averaging method, and selection criteria (best-val, last, early stopping)
+    - Evaluation metrics
+        - Primary and secondary metrics
+        - Examples: Accuracy / F1 / AUROC (classification), RMSE / MAE (regression), mAP (detection), mIoU (segmentation), BLEU / ROUGE / METEOR (generation), NDCG / MRR (ranking), ECE / Brier Score (calibration)
+    - Comparisons
+        - Prior methods (strong baselines, SOTA, simple baselines), etc.
+        - If there are implementation or configuration differences, note the adjustments in footnotes.
+    - Methods for analyzing important hyperparameters (e.g., learning rate, temperature, k, thresholds)
+    - Methods for assessing robustness
+        - Resistance to noise injection, distribution shift (OOD), adversarial perturbations, and domain transfer
+    - Computation of FLOPs, training/inference time, memory usage, and cost / wall-clock time
+    - Example experimental code
+- In addition, describe the experimental details as thoroughly as possible. It is acceptable if the output is long.
+- Avoid excessive redundancy across experiments. When a single experiment can cover multiple validation items, integrate them appropriately.
+- NO-FALLBACK CONSTRAINT: Never suggest using synthetic/dummy/placeholder data - if real datasets are unavailable, the experiment must terminate with clear error messages.
+- "Reference Information from Previous Iteration"
+
+## Output Format
+Please provide:
+- experiment_details: Detailed experimental plan following all the instructions above
+- expected_models: A list of specific model names/architectures that will be used in the experiments (e.g., ["ResNet-50", "BERT-base", "GPT-3.5-turbo"])
+- expected_datasets: A list of specific dataset names that will be used in the experiments (e.g., ["CIFAR-10", "ImageNet", "IMDB Reviews"])
+
+
+# Experimental Environment
+NVIDIA A100
+VRAM：80GB
+RAM：2048 GB
+
+# Current Research Method (Target for Experiment Design)
+{
+    "Open Problems": "Token-level cross-entropy remains the only generally-usable objective for PEFT / LoRA instruction tuning, even though it (a) quickly over-fits the few-shot SFT sets, (b) yields over-confident, poorly calibrated probabilities, and (c) catastrophically forgets zero-shot skills learned during pre-training.  Preference-based objectives (DPO, DiscoPOP) fix alignment but make calibration even worse and still damage knowledge when β is mis-set.  A single objective that 1) preserves the base model’s knowledge, 2) exploits both labelled and preference data, 3) stays numerically stable without hand picking β, and 4) can be dropped into any HuggingFace LoRA script with <100 lines of PyTorch is still missing.",
+    "Methods": "We upgrade the original CALM idea into APEX-Loss (Adaptive Pareto-Efficient miX).  Key novelties over CALM:  1. Pareto-front weight learner.  Instead of the binary switch w_c and a fixed λ, we embed the three primitive losses—Spherical (S), Preference (P), and KL (K)—into a 3-D objective space.  A tiny two-layer MLP (≈30 k parameters; frozen after meta-training) takes as input three scalars (current batch means of S, P, K) and outputs non-negative mixing weights α_s, α_p, α_k that sum to 1 through softmax.  The MLP was meta-trained off-line on synthetic mixtures of noisy-clean-preference data to approximate the hyper-volume improvement (HVI) criterion, giving a differentiable, single-pass approximation of the Pareto-optimal weight vector for each batch.  This removes hand-tuning and adapts automatically as training progresses.  2. Temperature-calibrated scoring rule.  We replace plain Spherical with a Temperature-Scaled Spherical score S_T = S(ph/τ) where τ itself is a learnable global scalar updated by gradient descent to minimise ECE on a held-out 1 % calibration split.  This gives provably strictly proper calibration while costing two extra FLOPs per token.  3. Elastic-KL with per-layer budgets.  Instead of one λ we constrain the mean KL of every transformer block’s output logits against the frozen base, enforced with the same dual-ascent trick but per layer.  This localises knowledge preservation to early layers (language syntax) while letting higher layers adapt to the new task.  4. Self-denoising mask.  Tokens whose predictive entropy is above the 80th percentile inside a batch are masked out of the gradient (no forward weight) rather than merely down-weighted; this behaves like dynamic, model-based data cleaning and adds zero extra parameters.  Full loss:  L = α_s·S_T + α_p·P + α_k·Σ_l λ_l·K_l,  computed per token (S_T, K_l) or per sequence (P), averaged with the mask.",
+    "Experimental Setup": "Models: Llama-2-7B-hf, Mistral-7B-Instruct, and—new for scalability—Phi-2-2.7B.  Data:  • SFT: Alpaca-52k + 50 k additional ShareGPT dumps purposely injected with 20 % synthetic label flips for noise.  • Preference: Argilla-DPO-Mix-7k plus 5 k toxicity-preference pairs (Anthropic-HH subset) to test multi-objective behaviour.  • 1 % of SFT data held-out for on-line ECE calibration of τ.  Baselines:  (A) Cross-Entropy  (B) DPO  (C) CALM (original)  (D) APEX (ours).  Each with identical LoRA config (r=16, α=32).  Metrics:  1. MT-Bench and AlpacaEval 2.0 (GPT-4 judge).  2. Expected Calibration Error on TruthfulQA-MC and SciQ-MC.  3. Knowledge retention: zero-shot MMLU + GSM8K 5-shot.  4. Robustness: measure metric decay when adding 10 %, 30 %, 50 % synthetic label noise.  5. Multi-objective alignment: win-rate on Toxicity-avoidance eval (Anthropic-HH).  6. Efficiency: GPU hours and wall-time.  All experiments run 3 seeds on 4×A100-40 GB; statistics via paired t-test.",
+    "Experimental Code": "# core APEX loss (simplified)\nclass APEXLoss(nn.Module):\n    def __init__(self, temp_init=1.0, kl_target=0.5):\n        super().__init__()\n        self.log_tau = nn.Parameter(torch.tensor(math.log(temp_init)))\n        self.meta_mlp = nn.Sequential(\n            nn.Linear(3,16), nn.SiLU(), nn.Linear(16,3))\n        self.register_buffer('lambda_l', torch.ones(32))  # for 32-layer model\n        self.kl_target = kl_target\n    def forward(self, spher, pref, kls):\n        # spher, pref: (B,)  kls: list of (B,) per layer\n        with torch.no_grad():\n            mean_vec = torch.tensor([\n                spher.mean(), pref.mean(), torch.stack(kls).mean()])\n            alpha = torch.softmax(self.meta_mlp(mean_vec),0)\n        loss = alpha[0]*spher.mean() + alpha[1]*pref.mean() + \\\n               alpha[2]*sum(l*kl.mean() for l,kl in zip(self.lambda_l,kls))\n        # dual ascent for each layer\n        with torch.no_grad():\n            for i,kl in enumerate(kls):\n                self.lambda_l[i].add_(1e-3*(kl.mean()-self.kl_target)).clamp_(0)\n        return loss\n# Temperature-scaled spherical term\nprobs = torch.softmax(logits/ self.log_tau.exp(), -1)\nS_T = 1 - (probs.gather(-1,labels[...,None]).squeeze() / probs.norm(dim=-1))\n",
+    "Expected Result": "1. APEX beats DPO by +3 MT-Bench win-rate points and +4 on AlpacaEval, surpassing CALM by +1.  2. ECE reduced 45 % versus CE and 25 % versus CALM.  3. MMLU drop ≤0.3 %; GSM8K unchanged—better than all baselines.  4. Under 50 % label noise, MT-Bench score retains 88 % of clean performance (vs 60 % for CE, 75 % for CALM).  5. Toxicity avoidance win-rate +6 over DPO, showing multi-objective balancing.  6. Training cost ↑ only 6 % wall-time over CE (meta-MLP negligible).",
+    "Expected Conclusion": "APEX-Loss delivers an end-to-end adaptive objective that sits on the Pareto frontier of calibration, alignment, and knowledge preservation without manual coefficient tuning.  The learned weight generator and layer-wise elastic KL let the optimiser focus capacity where it matters while freezing fundamentals, leading to higher instruction quality, markedly better probability estimates, and strong resilience to noisy or conflicting supervision.  Socially, this makes community LoRA fine-tunes safer and more stable out-of-the-box.  Academically, it unifies ideas from multi-objective optimisation, proper scoring rules, and adaptive calibration, opening a route to principled, automated loss design for future multi-modal or multi-task LLM fine-tuning."
+}
+
+# Experiment Strategy
+Experiment 1 – Component Ablation & Contribution Analysis
+----------------------------------------------------------------
+Goal: Quantify how much each novel sub-module of APEX (Pareto MLP, Temp-scaled Spherical, Elastic-KL, Self-denoising mask) contributes to the four target properties: instruction quality, calibration, knowledge retention, and noise-robustness.
+
+Design
+• Model/Data: Llama-2-7B-hf with the full training recipe already described (Alpaca 52 k + noisy ShareGPT; Argilla-DPO preferences). 
+• Variants (LoRA r=16, 3 random seeds):
+  A0  Full APEX (reference)
+  A1  – Pareto MLP → replace by fixed αs=0.33,αp=0.33,αk=0.34
+  A2  – Temp-scaled Spherical → ordinary Spherical, freeze τ=1
+  A3  – Elastic-KL → single global λ tuned once on dev set
+  A4  – Self-denoising mask → conventional entropy re-weighting (no masking)
+  A5  – All four removals (degenerates to CALM-style mix)
+
+Metrics (same eval harness): MT-Bench, AlpacaEval, ECE (TruthfulQA-MC), zero-shot MMLU, GSM8K-5-shot, noise stress-test (50 % label flips), GPU hours.
+
+Expected Read-out
+• A0 should dominate A1–A5 on every axis within paired t-test α=0.05.
+• Largest MT-Bench gap is expected when removing the Pareto MLP (A1), showing adaptive weighting is critical for quality/alignment.
+• ECE should worsen most in A2, isolating the temperature-scaled scoring rule’s role.
+• Knowledge retention drops sharply in A3, confirming that per-layer KL budgets protect pretrained competence.
+• Noise stress-test sensitivity spikes in A4, validating the self-denoising mask.
+• A5 should replicate CALM numbers, proving additivity, not mere parameter lucky-shot.
+Demonstration: Clear, orthogonal gains from every component certify that the full APEX recipe—not any single trick—achieves the claimed Pareto dominance.
+
+Experiment 2 – β-Sensitivity Curve vs. DPO (Alignment–Calibration Trade-off)
+--------------------------------------------------------------------------
+Goal: Show that APEX eliminates manual β tuning by staying on or near the Pareto front across the entire alignment/calibration spectrum, whereas DPO moves along a brittle 1-D curve.
+
+Design
+• Model: Mistral-7B-Instruct (LoRA r=16).  
+• Fixed training setup, but run DPO for β∈{0.01,0.1,0.3,1,3,10}.  Run APEX once (no hyper-parameter search).
+• For every checkpoint, measure: (1) MT-Bench, (2) ECE, (3) MMLU delta, (4) Toxicity-avoidance win-rate.
+• Plot four heat-maps: metric value vs. β; overlay horizontal APEX line.
+
+Expected Read-out
+• DPO exhibits strong metric trade-offs: high β → good alignment but disastrous ECE/knowledge; low β → opposite.  Sweet-spot narrow.
+• APEX single point lies inside the upper-right quadrant for all four plots—matching or exceeding DPO’s per-metric optimum simultaneously.
+Demonstration: The adaptive Pareto MLP makes APEX “set-and-forget”, automatically landing on a near-optimal alignment/calibration compromise that DPO can reach only by exhaustive β sweeps.
+
+Experiment 3 – Plug-and-Play Scalability & Generalisation
+---------------------------------------------------------
+Goal: Validate that APEX really is a drop-in loss usable across model sizes, domains, and hardware budgets with negligible overhead.
+
+Design
+• Models:  
+  – Phi-2-2.7B (single A100-80 GB)  
+  – Llama-2-13B (2×A100-80 GB)  
+  – Llama-2-70B (8×A100-80 GB, ZeRO-3)
+• Domains / data:  
+  – General instruction (Alpaca+ShareGPT, 20 % noise)  
+  – Code synthesis (Code-Alpaca 20 k + 2 k preference pairs)  
+  – Medical QA (MedAlpaca 8 k + 1 k physician preference pairs)
+• For each (model, domain) pair run CE baseline and APEX with identical LoRA configs; log:   
+  – Main domain metric (e.g. HumanEval pass@1, MedQA-USMLE accuracy)  
+  – ECE on in-domain multiple-choice val set  
+  – Zero-shot MMLU (knowledge bleed)  
+  – Wall-clock hours and peak GPU memory
+• Record lines of code changed: diff of training script (should be <100).
+
+Expected Read-out
+• APEX yields consistent +2‒6 % absolute gains on domain metrics across all three model sizes while cutting ECE by ≥30 % and keeping MMLU drop <1 %.
+• Compute overhead ≤8 % in GPU hours; memory overhead negligible (<0.3 GB from MLP & buffers).
+• Code diff ≤70 lines for all experiments, visually proving simplicity.
+Demonstration: Confirms APEX scales from 2.7 B to 70 B parameters, handles specialised domains, and really is a low-friction, resource-friendly plug-in—addressing practical adoption concerns.
+
+Collective Outcome
+These three orthogonal experiments (granular ablation, hyper-parameter-free robustness, and cross-domain scalability) will jointly demonstrate that APEX-Loss is (1) internally well-engineered, (2) externally robust without tuning, and (3) practically deployable, thereby validating the core research claims.
+
+---
+
+
+# Reference Information from Previous Iteration
+
+Output:
+{
+    "experiment_details": "=================================================\nGLOBAL PIPELINE USED BY ALL EXPERIMENTS\n=================================================\nHardware\n  •  NVIDIA A100-80 GB (CUDA 11.8) on a node with 2 TB RAM, Ubuntu 22.04, PyTorch 2.1.0, transformers 4.35, bitsandbytes 0.41.2, deepspeed 0.12.3, PEFT 0.6.0.\n  •  All LoRA adapters: r = 16, α = 32, dropout = 0.05, bnb 4-bit weight quantisation, AdamW β=(0.9,0.95), linear warm-up 1000 steps, cosine decay to 5 e-5, batch-size = 2048 tokens per GPU (gradient-accum 2).\n  •  Reproducibility: torch.manual_seed(seed); cuda deterministic kernels; seed list = [11, 17, 29].\n  •  Data split policy (unless overridden): 97 % train, 2 % validation (early-stop), 1 % calibration (τ update only, never back-prop).\n  •  Early stopping: patience = 2 on AlpacaEval dev set; checkpoint = best-val.\n  •  Reporting: mean±s.d. over 3 seeds; paired t-test (α = 0.05) versus Full-APEX.\n  •  FLOPs & memory: captured with torch.profiler; wall-time from Slurm job logs; cost = wall-time·$2.48/h (on-prem amortised).\n-------------------------------------------------\nCommon preprocessing\n  1.  All instruction-response corpora → unified JSONL {instruction, input, output}.\n  2.  Tokenisation: sentence-piece vocab of base model; max-seq-length = 2048.  Examples >2048 tokens are dropped (<0.8 %).\n  3.  Label-flip noise: Bernoulli(p) replacement of assistant output with a randomly sampled other answer from same batch; p configured per experiment.\n  4.  Preference data → (chosen, rejected) pairs.  Reject tokenisation identical.\n  5.  Multiple-choice eval sets (TruthfulQA-MC, SciQ-MC) kept untouched; answer indices mapped to ids 0-3.\n  6.  For Code/Medical domains: code fenced with <|im_start|>code / <|im_end|>; medical answers terminated with “### End.” sentinel to avoid prompt bleed-through.\n=================================================\nEXPERIMENT 1 – COMPONENT ABLATION & CONTRIBUTION ANALYSIS\n=================================================\nModels\n  Llama-2-7B-hf (LoRA only).\nVariants (3 seeds)\n  A0  Full-APEX (reference)\n  A1  Fixed weights α=[.33,.33,.34], no Pareto-MLP\n  A2  Plain Spherical loss, τ = 1 (frozen)\n  A3  One global KL λ tuned on val to hit KL≈0.5\n  A4  Entropy re-weight (w = 1 – H/H_max) instead of hard mask\n  A5  All four removals  ➜ CALM-style\nData\n  Train = Alpaca-52k ∪ noisy-ShareGPT-50k (20 % flips)\n  Preference = Argilla-DPO-Mix-7k ∪ Anthropic-HH-tox-5k\n  Calibration split = 1 % of Alpaca\nEvaluation Metrics\n  Primary: MT-Bench (GPT-4 judge win-rate), AlpacaEval 2.0 score\n  Secondary: ECE(TruthfulQA-MC), MMLU(0-shot acc), GSM8K(5-shot acc), Noise-decay @50 % flips (ΔMT-Bench), GPU-hours\nHyper-parameter sweeps\n  Not needed (except λ in A3 tuned on val grid {0.05,0.1,0.3,0.5,1}).\nRobustness tests\n  Re-train each variant with extra 30 % and 50 % flip noise; measure MT-Bench drop.\nCompute logging\n  •  Profiler at every 500 steps → average FLOPs / forward; peak mem with nvidia-smi.\nExample code (ablation flag)\n  parser.add_argument(\"--ablate\",choices=[\"none\",\"mlp\",\"temp\",\"ekl\",\"mask\",\"all\"],...)\n  if args.ablate in (\"mlp\",\"all\"):  apex.use_mlp=False\n  …\nExpected run-time (4×A100):  ~9.2 GPU-h per seed ⇒ 165 $ cost total.\n=================================================\nEXPERIMENT 2 – β-SENSITIVITY CURVE vs DPO\n=================================================\nModel\n  Mistral-7B-Instruct + LoRA.\nSystems compared\n  •  APEX (single run)\n  •  DPO β∈{0.01,0.1,0.3,1,3,10} (6 runs)\nData & Splits\n  Same corpus as Exp-1 but using 15 % flip noise to accentuate brittleness.  Split identical.\nTraining details\n  3 seeds ×7 systems ⇒ 21 runs.  For DPO: keep SFT warm-up 500 steps with CE, then DPO only.\nEvaluation\n  1. MT-Bench\n  2. ECE(TruthfulQA-MC)\n  3. ΔMMLU vs base (knowledge loss)\n  4. Toxicity-avoidance win-rate (Anthropic eval harness)\nPost-processing\n  •  Normalise each metric to [0,1] (best across grid =1).\n  •  Produce heat-maps metric vs β; plot horizontal line for APEX (matplotlib).\nRobustness/OOD\n  Additional run: evaluate all checkpoints on Vicuna-Bias dataset to test moral OOD; plot calibration gap.\nCompute\n  One A100 per run; average 6.8 GPU-h ⇒ whole grid ≈ 143 GPU-h.\n=================================================\nEXPERIMENT 3 – PLUG-AND-PLAY SCALABILITY & GENERALISATION\n=================================================\nModels\n  •  Phi-2-2.7B  (single-GPU)\n  •  Llama-2-13B (2 GPU, ZeRO-2)\n  •  Llama-2-70B (8 GPU, ZeRO-3 + CPU offload)\nDomains / Datasets\n  General  : Alpaca-52k + noisy-ShareGPT-50k\n  Code     : Code-Alpaca-20k  + 2 k Pref (CodeReviewer)  (JSONL ‹instruction,output› and ‹chosen,rejected›)\n  Medical  : MedAlpaca-8k + 1 k physician-prefs (MediDPO)  \nPre-processing specifics\n  Code: preserve indentation; apply tiktoken code-gpt tokenizer when calculating spherical term to avoid TAB vs space token drift.\n  Medical: strip patient identifiers to comply with HIPAA.\nSplits\n  Same 97/2/1 policy per domain.\nBaselines\n  •  CE-only (standard SFT)\n  •  APEX (ours)\nTraining budget & schedule\n  Phi-2: 5 epochs, 3.4 GPU-h  |  Llama-13B: 3 epochs, 12 GPU-h  |  Llama-70B: 1.2 epochs, 64 GPU-h.\nEvaluation per domain\n  General: MT-Bench, AlpacaEval 2.0\n  Code   : HumanEval pass@1 (nl-to-code) – evaluated with latest eval-plus harness\n  Medical: MedQA-USMLE (multiple-choice accuracy)\n  For all: ECE on in-domain MC val set; MMLU (0-shot); wall-clock & peak-mem.\nRobustness test\n  Domain transfer: test Phi-2-Code model on StackOverflow-De-noise set ➔ record drop-off.\nHyper-param analysis\n  Sweep learning-rate {5e-5,1e-4,2e-4} on Phi-2 domain triad to verify APEX stability; report coefficient of variation of final metric.\nCode-diff audit\n  run  git diff  --stat  to count added lines; automated script included in repo/ci.\n=================================================\nNOTES / FOOTNOTES\n-------------------------------------------------\n1.  Original CALM implementation clamps λ≥0 only once per epoch; our A3 variant keeps that behaviour for fidelity.\n2.  All preference datasets are public and come with non-commercial licences; no synthetic placeholders are introduced, satisfying NO-FALLBACK.\n3.  FLOP calculation follows “ptflops” ‑ theoretical dense FLOPs; 4-bit quantisation slightly lowers real FLOPs by ≈15 % but we keep dense number for comparability.\n4.  Peak GPU memory figures include optimizer states but exclude ZeRO CPU off-load buffers in Llama-70B runs.\n-------------------------------------------------\nExample launch command (Exp-1, seed 11, variant A2)\nCUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed  train_apex.py  \\ \n  --model_path llama2-7b-hf  --lora_r 16  --variant A2  \\ \n  --train_json ../alpaca_sharegpt.jsonl  --pref_json ../argilla_hh.jsonl  \\\n  --seed 11  --output_dir runs/exp1/A2/s11  --deepspeed configs/ds_z2.json\n=================================================\n",
+    "expected_models": [
+        "Llama-2-7B-hf",
+        "Mistral-7B-Instruct",
+        "Phi-2-2.7B",
+        "Llama-2-13B",
+        "Llama-2-70B"
+    ],
+    "expected_datasets": [
+        "Alpaca-52k",
+        "ShareGPT-50k",
+        "Argilla-DPO-Mix-7k",
+        "Anthropic-HH Toxicity subset",
+        "TruthfulQA-MC",
+        "SciQ-MC",
+        "MMLU",
+        "GSM8K",
+        "Code-Alpaca-20k",
+        "HumanEval",
+        "MedAlpaca-8k",
+        "MedQA-USMLE",
+        "MT-Bench",
+        "AlpacaEval 2.0",
+        "StackOverflow De-noise"
+    ]
+}
